@@ -1,0 +1,11 @@
+{
+  "name": "agent-tree",
+  "owner": { "name": "tellship" },
+  "plugins": [
+    {
+      "name": "agent-tree",
+      "source": "./",
+      "description": "A pane docked beside the transcript showing every agent and its delegation as a live tree"
+    }
+  ]
+}

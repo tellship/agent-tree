@@ -1,0 +1,1 @@
+{ "name": "agent-tree", "version": "0.1.0", "description": "A pane docked beside the transcript showing every agent and its delegation as a live tree", "types": "./types/index.d.ts" }
