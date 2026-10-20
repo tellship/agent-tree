@@ -1,5 +1,7 @@
 # agent-tree
 
+[![ci](https://github.com/tellship/agent-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/tellship/agent-tree/actions/workflows/ci.yml)
+
 A Claude Code mod: a pane docked beside the transcript that shows every agent
 and its delegation as a live tree.
 
