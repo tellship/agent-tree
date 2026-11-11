@@ -10,6 +10,7 @@ import {
   clearOutput,
   closeOutput,
   commandOutput,
+  contextMeasured,
   emptyTree,
   hasRunning,
   isAsciiLocale,
@@ -123,6 +124,7 @@ export const register: Register = on => {
         agentId,
         parentAgentId: e.parentAgentId,
         subagentType: e.subagentType,
+        model: started.model,
         name: e.name,
         description: e.description,
         prompt: e.prompt,
@@ -153,6 +155,14 @@ export const register: Register = on => {
     const consults = advisorEvents(response.serverToolUses, e.agentId, await $.clock.now())
     if (consults.length > 0) await recordChange($, t => consults.reduce(applyEvent, t))
 
+    // This hook has no catch handler to fall back on, so a failed reading must not reach the response stream.
+    if (e.agentId !== undefined && response.usage !== null) {
+      try {
+        const { context } = await $.session.usage()
+        await record($, contextMeasured(e.agentId, response.usage, await $.session.model(), context.window))
+      } catch {}
+    }
+
     return response
   })
 
@@ -169,6 +179,7 @@ export const register: Register = on => {
       await read($, isAscii),
       (await read($, selectedId)) ?? undefined,
       (await read($, summaryOpen)) ?? undefined,
+      await $.session.model(),
     )
     const { Box, Button, Text } = $.ui.resolve(e)
     const drawPiece = (isSelected: boolean) => ({ role, text }: Segment) => (

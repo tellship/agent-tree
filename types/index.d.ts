@@ -14,6 +14,9 @@ export type AgentNode = {
   kind?: 'advisor'
   name?: string
   subagentType?: string
+  model?: string
+  contextTokens?: number
+  contextWindow?: number
   description?: string
   task?: string
   taskCut?: boolean
@@ -26,7 +29,15 @@ export type AgentNode = {
 
 export type PendingCompletion = { agentId: string; reason: string; durationMs?: number }
 
-export type AgentTree = { nodes: AgentNode[]; pendingCompletions: PendingCompletion[]; startedAt?: number }
+export type PendingContext = { agentId: string; tokens: number; window: number }
+
+// pendingContexts is optional: a tree stored before it existed has none.
+export type AgentTree = {
+  nodes: AgentNode[]
+  pendingCompletions: PendingCompletion[]
+  pendingContexts?: PendingContext[]
+  startedAt?: number
+}
 
 declare module 'claude-code' {
   interface PluginState {

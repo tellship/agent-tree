@@ -1,6 +1,6 @@
-import type { TurnStepServerToolUse, UiOpenResult } from 'claude-code'
+import type { TurnStepServerToolUse, TurnUsage, UiOpenResult } from 'claude-code'
 
-import type { AgentNode, AgentStatus, AgentTree, PaneRow, PendingCompletion, Role, Row, Segment } from '../types'
+import type { AgentNode, AgentStatus, AgentTree, PaneRow, PendingCompletion, PendingContext, Role, Row, Segment } from '../types'
 
 export type TreeEvent =
   | { type: 'session.started'; at?: number }
@@ -10,6 +10,7 @@ export type TreeEvent =
       agentId: string
       parentAgentId?: string
       subagentType?: string
+      model?: string
       name?: string
       description?: string
       prompt?: string
@@ -17,6 +18,7 @@ export type TreeEvent =
     }
   | { type: 'turn.complete'; agentId?: string; reason: string; durationMs?: number }
   | { type: 'turn.stepped'; agentId: string }
+  | { type: 'context.measured'; agentId: string; tokens: number; window: number }
   | { type: 'tool.called'; agentId: string; tool: string; input: Readonly<Record<string, unknown>> }
   | { type: 'advisor.consulted'; id: string; agentId?: string; startedAt: number; endedAt?: number; at: number }
   | { type: 'finished.cleared' }
@@ -34,6 +36,8 @@ type Alphabet = {
   blank: string
   step: string
   advisor: string
+  model: string
+  separator: string
   ellipsis: string
   marker: string
   rule: string
@@ -47,6 +51,8 @@ const UNICODE: Alphabet = {
   blank: '  ',
   step: '↳',
   advisor: '♛',
+  model: '◆',
+  separator: '·',
   ellipsis: '…',
   marker: '›',
   rule: '─',
@@ -60,6 +66,8 @@ const ASCII: Alphabet = {
   blank: '   ',
   step: '->',
   advisor: '^',
+  model: '#',
+  separator: '-',
   ellipsis: '...',
   marker: '>',
   rule: '-',
@@ -168,8 +176,20 @@ const holdCompletion = (tree: AgentTree, completion: PendingCompletion): AgentTr
   pendingCompletions: [...tree.pendingCompletions.filter(p => p.agentId !== completion.agentId), completion],
 })
 
+// Likewise an agent's steps can all come before its spawn, so a reading for an unknown id waits for it.
+const holdContext = (tree: AgentTree, context: PendingContext): AgentTree => ({
+  ...tree,
+  pendingContexts: [...(tree.pendingContexts ?? []).filter(p => p.agentId !== context.agentId), context],
+})
+
+const contextFields = ({ tokens, window }: PendingContext): Pick<AgentNode, 'contextTokens' | 'contextWindow'> => ({
+  contextTokens: tokens,
+  contextWindow: window,
+})
+
 const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.spawned' }>): AgentTree => {
   const held = tree.pendingCompletions.find(p => p.agentId === event.agentId)
+  const heldContext = tree.pendingContexts?.find(p => p.agentId === event.agentId)
   const spawned: AgentTree = {
     ...tree,
     nodes: [
@@ -178,6 +198,8 @@ const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.sp
         agentId: event.agentId,
         parentAgentId: event.parentAgentId,
         subagentType: event.subagentType,
+        model: event.model,
+        ...(heldContext === undefined ? {} : contextFields(heldContext)),
         name: event.name,
         description: event.description === undefined ? undefined : maskSecrets(event.description),
         ...storedTask(event.prompt),
@@ -186,6 +208,7 @@ const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.sp
       },
     ],
     pendingCompletions: tree.pendingCompletions.filter(p => p.agentId !== event.agentId),
+    ...(tree.pendingContexts === undefined ? {} : { pendingContexts: tree.pendingContexts.filter(p => p.agentId !== event.agentId) }),
   }
   return held === undefined ? spawned : completeAgent(spawned, held)
 }
@@ -252,6 +275,12 @@ export const applyEvent = (tree: AgentTree, event: TreeEvent): AgentTree => {
       return spawnAgent(tree, event)
     case 'turn.stepped':
       return updateRunning(tree, event.agentId, { currentStep: THINKING })
+    case 'context.measured': {
+      const context = { agentId: event.agentId, tokens: event.tokens, window: event.window }
+      return tree.nodes.some(node => node.agentId === event.agentId)
+        ? updateNode(tree, event.agentId, node => ({ ...node, ...contextFields(context) }))
+        : holdContext(tree, context)
+    }
     case 'tool.called':
       return updateRunning(tree, event.agentId, { currentStep: stepFor(event.tool, event.input) })
     case 'turn.complete': {
@@ -303,6 +332,50 @@ export const formatElapsed = (ms: number): string => {
   if (minutes > 0) return `${minutes}m ${twoDigits(seconds % 60)}s`
   return `${seconds}s`
 }
+
+// `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` and `claude-3-5-sonnet-20241022` read `sonnet 5.5`, `haiku 4.5` and `sonnet 3.5`.
+// Anything else (an alias, a display name, a provider's id) is shown as it came.
+const FAMILY_FIRST = /^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[[^\]]*\])?$/
+const VERSION_FIRST = /^(?:claude-)?(\d+)(?:-(\d{1,2}))?-(opus|sonnet|haiku)(?:-\d{8})?(\[[^\]]*\])?$/
+
+export const shortModel = (model: string): string => {
+  const family = FAMILY_FIRST.exec(model)
+  const version = family === null ? VERSION_FIRST.exec(model) : null
+  const [name, major, minor, suffix] =
+    family !== null ? [family[1], family[2], family[3], family[4]] : version !== null ? [version[3], version[1], version[2], version[4]] : []
+  if (name === undefined) return model
+
+  return `${name} ${major}${minor === undefined ? '' : `.${minor}`}${suffix === undefined ? '' : ` ${suffix}`}`
+}
+
+// The engine reports no window for a subagent's model, only the session's own, so a model is taken to have the session's window when it is
+// the session's model (`[1m]` and a date left out of the comparison) and DEFAULT_WINDOW otherwise.
+export const DEFAULT_WINDOW = 200_000
+
+const modelKey = (model: string): string => shortModel(model.replace(/\[[^\]]*\]$/, ''))
+
+export const windowFor = (agentModel: string, sessionModel: string | undefined, sessionWindow: number): number =>
+  sessionModel !== undefined && modelKey(agentModel) === modelKey(sessionModel) ? sessionWindow : DEFAULT_WINDOW
+
+// The status line's figure: the input side of the response, uncached, cache-written and cache-read together. Not summed over steps.
+export const contextMeasured = (
+  agentId: string,
+  usage: TurnUsage,
+  sessionModel: string | undefined,
+  sessionWindow: number,
+): TreeEvent => ({
+  type: 'context.measured',
+  agentId,
+  tokens: usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+  window: windowFor(usage.model, sessionModel, sessionWindow),
+})
+
+const contextPercent = ({ contextTokens, contextWindow }: AgentNode): number | undefined =>
+  contextTokens === undefined || contextWindow === undefined || contextWindow <= 0
+    ? undefined
+    : Math.round((contextTokens / contextWindow) * 100)
+
+const withCommas = (n: number): string => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 
 const FLIGHTDECK_AGENT_CAP = 24
 const DEPTH_CAP = 4
@@ -375,6 +448,14 @@ const elapsedMs = (node: AgentNode, now: number): number | undefined =>
 
 const mainLabel = (tree: AgentTree, now: number): string =>
   tree.startedAt === undefined ? 'Main' : `Main ${formatElapsed(now - tree.startedAt)}`
+
+// Main's model follows its time. Under GLYPH_ONLY_BELOW columns there is no room, and the cut keeps the row inside the pane.
+const mainPaneRow = (tree: AgentTree, now: number, columns: number, alphabet: Alphabet, mainModel: string | undefined): PaneRow => {
+  const label = segment('plain', mainLabel(tree, now))
+  if (mainModel === undefined || columns < GLYPH_ONLY_BELOW) return asPaneRow(row(label))
+
+  return asPaneRow(cut(row(label, segment('dim', ` ${alphabet.model} ${shortModel(mainModel)}`)), columns, alphabet.ellipsis))
+}
 
 const titleOf = (node: AgentNode): string => node.name || node.subagentType || 'agent'
 
@@ -453,6 +534,12 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
     ...shown.flatMap((node, index) => {
       const isLast = index === shown.length - 1
       const stem = isLast ? alphabet.blank : alphabet.trunk
+      const percent = contextPercent(node)
+      const used = percent === undefined ? '' : ` ${alphabet.separator} ${percent}%`
+      const model =
+        node.model !== undefined && view.columns >= GLYPH_ONLY_BELOW
+          ? [dimPaneRow(`${lead}${stem} ${alphabet.model} ${shortModel(node.model)}${used}`, view)]
+          : []
       // The cut that kept a long tool input to SUBJECT_LIMIT was stored as …, whichever alphabet draws it.
       const step =
         node.currentStep !== undefined && view.columns >= GLYPH_ONLY_BELOW
@@ -460,6 +547,7 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
           : []
       return [
         nodePaneRow(nodeLine(node, `${lead}${isLast ? alphabet.last : alphabet.branch}`, view), node, view),
+        ...model,
         ...step,
         ...branchLines(groups, node.agentId, `${indent}${stem}`, depth + 1, view),
       ]
@@ -468,8 +556,17 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
 }
 
 // Above Flightdeck's cap, finished subtrees fold into summary rows and the footer says how many agents are still drawn.
-const drawTree = (tree: AgentTree, columns: number, now: number, isAscii: boolean, selection?: Selection): PaneRow[] => {
-  if (tree.nodes.length === 0) return [asPaneRow(row(segment('plain', mainLabel(tree, now)))), asPaneRow(dimRow(EMPTY_HINT))]
+const drawTree = (
+  tree: AgentTree,
+  columns: number,
+  now: number,
+  isAscii: boolean,
+  selection?: Selection,
+  mainModel?: string,
+): PaneRow[] => {
+  const alphabet = isAscii ? ASCII : UNICODE
+  const main = mainPaneRow(tree, now, columns, alphabet, mainModel)
+  if (tree.nodes.length === 0) return [main, asPaneRow(dimRow(EMPTY_HINT))]
 
   const groups = groupByParent(tree.nodes)
   const overflowing = tree.nodes.length > FLIGHTDECK_AGENT_CAP
@@ -479,7 +576,7 @@ const drawTree = (tree: AgentTree, columns: number, now: number, isAscii: boolea
     columns,
     now,
     folded: new Set(foldedRoots.map(root => root.agentId)),
-    alphabet: isAscii ? ASCII : UNICODE,
+    alphabet,
     gutter: selection !== undefined && columns >= GLYPH_ONLY_BELOW ? GUTTER : 0,
     selectedId: selection?.selectedId,
   }
@@ -489,7 +586,7 @@ const drawTree = (tree: AgentTree, columns: number, now: number, isAscii: boolea
     : []
   const widenHint = columns < GLYPH_ONLY_BELOW ? [asPaneRow(row()), dimPaneRow(WIDEN_HINT, flush)] : []
 
-  return [asPaneRow(row(segment('plain', mainLabel(tree, now)))), ...branchLines(groups, undefined, '', 1, view), ...footer, ...widenHint]
+  return [main, ...branchLines(groups, undefined, '', 1, view), ...footer, ...widenHint]
 }
 
 export const renderRows = (tree: AgentTree, columns: number, now: number, isAscii = false): Row[] =>
@@ -576,10 +673,13 @@ export const detailRows = (node: AgentNode, parentLabel: string, now: number, co
   const reason = node.reason === undefined ? '' : ` (${node.reason})`
   const elapsed = elapsedMs(node, now)
   const step = node.currentStep?.replaceAll(UNICODE.ellipsis, alphabet.ellipsis)
+  const percent = contextPercent(node)
 
   return [
     ...wrapText(heading, columns).map(line => row(segment('title', line))),
     ...(isNarrow ? [] : field('Kind', node.kind === 'advisor' ? heading : 'subagent')),
+    ...(node.model === undefined ? [] : field('Model', node.model)),
+    ...(percent === undefined ? [] : field('Context', `${percent}% (${withCommas(node.contextTokens!)} / ${withCommas(node.contextWindow!)})`)),
     ...field('Status', `${alphabet.glyph[node.status]} ${node.status}${reason}`, node.status),
     ...(elapsed === undefined ? [] : field('Elapsed', formatElapsed(elapsed))),
     ...(step === undefined ? [] : field('Step', step)),
@@ -617,8 +717,9 @@ export const renderPane = (
   isAscii: boolean,
   selectedId: string | undefined,
   openSummaryId?: string,
+  mainModel?: string,
 ): PaneRow[] => {
-  const treeRows = drawTree(tree, columns, now, isAscii, { selectedId })
+  const treeRows = drawTree(tree, columns, now, isAscii, { selectedId }, mainModel)
   if (tree.nodes.length === 0 || columns < GLYPH_ONLY_BELOW) return treeRows
 
   const alphabet = isAscii ? ASCII : UNICODE
