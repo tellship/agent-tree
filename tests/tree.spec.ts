@@ -17,6 +17,7 @@ import {
   renderLines as renderAt,
   renderPane,
   renderRows as rowsAt,
+  shortModel,
   storedTask,
   summaryLines,
   wrapText,
@@ -2852,4 +2853,121 @@ test('SUM no drawn row of an open summary holds the raw secret, and a secret fil
     assert.equal(shown.includes(SECRET), false)
     assert.equal(shown.includes('/srv/app'), false)
   }
+})
+
+const SONNET = 'claude-sonnet-5-5'
+const OPUS = 'claude-opus-5-5'
+const HAIKU = 'claude-haiku-4-5-20251001'
+
+const modelTree = apply(
+  spawned('a', { name: 'A', model: OPUS }),
+  spawned('b', { name: 'B', parentAgentId: 'a', model: SONNET }),
+  spawned('c', { name: 'general-purpose', parentAgentId: 'b', model: HAIKU, description: 'scan the repo' }),
+)
+
+const modelLines = (tree: Tree, columns: number, mainModel: string | undefined, ascii = false, now = NOW) =>
+  renderPane(tree, columns, now, ascii, undefined, undefined, mainModel).map(({ row }) => textOfRow(row))
+
+test('MODEL shortModel reads the family and version from an id and passes anything else through unchanged', () => {
+  assert.equal(shortModel('claude-sonnet-5-5'), 'sonnet 5.5')
+  assert.equal(shortModel('claude-opus-5-5'), 'opus 5.5')
+  assert.equal(shortModel('claude-fable-5-2'), 'fable 5.2')
+  assert.equal(shortModel('claude-haiku-4-5-20251001'), 'haiku 4.5')
+  assert.equal(shortModel('claude-3-5-sonnet-20241022'), 'sonnet 3.5')
+  assert.equal(shortModel('claude-opus-4'), 'opus 4')
+  assert.equal(shortModel('claude-sonnet-5-20251001'), 'sonnet 5')
+  assert.equal(shortModel('claude-opus-5-5[1m]'), 'opus 5.5 [1m]')
+
+  for (const other of ['sonnet', 'inherit', 'Sonnet 5.5', 'us.anthropic.claude-sonnet-5-5-v1:0', 'claude-sonnet', ''])
+    assert.equal(shortModel(other), other)
+})
+
+test('MODEL agent.spawned keeps the model the spawn resolved to, and none when there was none', () => {
+  const tree = apply(spawned('a', { model: SONNET }), spawned('b'))
+
+  assert.deepEqual(tree.nodes.map(node => node.model), [SONNET, undefined])
+})
+
+test('MODEL each agent gets a dim model line under its own, level with the status glyph, and Main shows the main model', () => {
+  assert.deepEqual(modelLines(modelTree, 40, SONNET).slice(0, 7), [
+    'Main ◆ sonnet 5.5',
+    '  └─ ● running A',
+    '     ◆ opus 5.5',
+    '    └─ ● running B',
+    '       ◆ sonnet 5.5',
+    '      └─ ● running general-purpose: sca…',
+    '         ◆ haiku 4.5',
+  ])
+  assert.deepEqual(modelLines(modelTree, 40, SONNET, true).slice(0, 7), [
+    'Main # sonnet 5.5',
+    '  `-- * running A',
+    '      # opus 5.5',
+    '     `-- * running B',
+    '         # sonnet 5.5',
+    '        `-- * running general-purpose...',
+    '            # haiku 4.5',
+  ])
+})
+
+test('MODEL the model line sits above the step line', () => {
+  const tree = applyEvent(modelTree, called('c', 'Read', { file_path: 'one.ts' }))
+
+  assert.deepEqual(modelLines(tree, 40, undefined).slice(5, 8), [
+    '      └─ ● running general-purpose: sca…',
+    '         ◆ haiku 4.5',
+    '         ↳ Read one.ts',
+  ])
+})
+
+test('MODEL a chain deeper than the indent cap still shows every model, inside the pane', () => {
+  const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+  const chain = apply(...ids.map((id, index) => spawned(id, { name: 'general-purpose', parentAgentId: ids[index - 1], model: SONNET })))
+  const lines = modelLines(chain, 40, SONNET)
+
+  assert.equal(lines.filter(line => line.endsWith('◆ sonnet 5.5')).length, ids.length + 1)
+  for (const line of lines) assert.equal([...line].length <= 40, true, line)
+})
+
+test('MODEL Main shows its model beside its time, and on the empty tree', () => {
+  const started = apply({ type: 'session.started', at: NOW - 5_000 })
+
+  assert.equal(modelLines(started, 40, SONNET)[0], 'Main 5s ◆ sonnet 5.5')
+  assert.deepEqual(modelLines(emptyTree, 40, 'opus').slice(0, 2), ['Main ◆ opus', EMPTY_HINT])
+})
+
+test('MODEL nothing is drawn for a model that is not known', () => {
+  const tree = apply(spawned('a', { name: 'A' }))
+
+  assert.deepEqual(modelLines(tree, 40, undefined).slice(0, 2), ['Main', '  └─ ● running A'])
+  assert.equal(modelLines(tree, 40, undefined).join('\n').includes('◆'), false)
+})
+
+test('MODEL under 16 columns there is no model row, and no row is wider than the pane from 16 up', () => {
+  assert.deepEqual(modelLines(modelTree, 15, SONNET), renderLines(modelTree, 15))
+
+  for (const columns of [16, 20, 24, 30, 40]) {
+    for (const ascii of [false, true]) {
+      for (const line of modelLines(modelTree, columns, SONNET, ascii).slice(0, 7)) {
+        assert.equal([...line].length <= columns, true, `${columns} ${ascii}: ${line}`)
+      }
+    }
+  }
+})
+
+test('MODEL the detail view names the model by its full id, between Kind and Status, and leaves it out when unknown', () => {
+  assert.deepEqual(detailRows(nodeOf(modelTree, 'c'), 'B', NOW, 40, false).map(textOfRow).slice(0, 4), [
+    'general-purpose',
+    'Kind     subagent',
+    'Model    claude-haiku-4-5-20251001',
+    'Status   ● running',
+  ])
+  assert.equal(detailRows(nodeOf(apply(spawned('a', { name: 'A' })), 'a'), 'Main', NOW, 40, false).map(textOfRow).join('\n').includes('Model'), false)
+})
+
+test('MODEL the advisor has no model line and no Model field', () => {
+  const tree = apply(spawned('a', { name: 'A', model: SONNET }), consulted(ADVISOR_NODE))
+  const advisor = tree.nodes.find(node => node.kind === 'advisor')!
+
+  assert.equal(advisor.model, undefined)
+  assert.equal(detailRows(advisor, 'A', NOW, 40, false).map(textOfRow).join('\n').includes('Model'), false)
 })

@@ -123,6 +123,7 @@ export const register: Register = on => {
         agentId,
         parentAgentId: e.parentAgentId,
         subagentType: e.subagentType,
+        model: started.model,
         name: e.name,
         description: e.description,
         prompt: e.prompt,
@@ -169,6 +170,7 @@ export const register: Register = on => {
       await read($, isAscii),
       (await read($, selectedId)) ?? undefined,
       (await read($, summaryOpen)) ?? undefined,
+      await $.session.model(),
     )
     const { Box, Button, Text } = $.ui.resolve(e)
     const drawPiece = (isSelected: boolean) => ({ role, text }: Segment) => (

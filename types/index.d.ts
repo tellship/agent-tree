@@ -14,6 +14,7 @@ export type AgentNode = {
   kind?: 'advisor'
   name?: string
   subagentType?: string
+  model?: string
   description?: string
   task?: string
   taskCut?: boolean
